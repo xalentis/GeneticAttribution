@@ -2,14 +2,12 @@
 # Implementation of paper: Deep learning to predict the lab-of-origin of engineered DNA
 # Nielsen, A and Voigt, C (Voigt Labs)
 # URL: https://www.nature.com/articles/s41467-018-05378-z.pdf?origin=ppub
-# Paper results in predictive accuracy of 48%, my model delivers 75.4% on validation set (10%)
+# Paper results in predictive accuracy of 48%, my model delivers 70% on validation set (10%)
 
 # NOTE: The dataset used here provided from this URL:
 # https://www.drivendata.org/competitions/63/genetic-engineering-attribution
 # 60,000 DNA sequences with lab of origin as label
 
-# WARNING: This model creates a 60391x16048x4 matrix requiring at least 30GB RAM
-# Training done on Intel i9 10-core with dual Nvidia RTX2080rti GPU stack
 # Training time: 157 mins for 25 epochs
 
 library(data.table)
@@ -17,7 +15,13 @@ library(stringr)
 library(keras)
 library(dplyr)
 library(tidyverse)
-library(XalBio) # get from https://github.com/xalentis/XalBio
+
+# DNA sequence one-hot encoding routines:
+library(XalBio)  # devtools::install_github("https://github.com/xalentis/XalBio")
+
+# compress one-hot vector and decompress as required, reduces memory
+# footprint from 29G down to 7G
+library(XalUtil) # devtools::install_github("https://github.com/xalentis/XalUtil")
 
 # data from: https://www.drivendata.org/competitions/63/genetic-engineering-attribution/
 data <- fread("train_values.csv", data.table = TRUE)
@@ -79,12 +83,11 @@ if (calculate_weights == TRUE)
 }
 
 ############################### DNA encoding to one-hot ###############################
-one_hot_encode<-function(data, start, chunk_size)
+one_hot_encode<-function(data, start, block_size)
 {
-  data_matrix <- array(dim = c(chunk_size, 16048, 4))
+  data_matrix <- array(0,dim = c(block_size, 16048))
 
-  index <- 1
-  for (row in start:(start + (chunk_size - 1))) 
+  for (row in start:(start + (block_size - 1))) 
   {
     sequence <- data[row,"sequence"][[1]]
 
@@ -97,8 +100,7 @@ one_hot_encode<-function(data, start, chunk_size)
     reverse <- str_pad(reverse, 8000, side = c("right"), pad = "N")
     sequence <- str_pad(sequence, 8000, side = c("right"), pad = "N")
     one_hot <- encode_sequence(sequence, reverse,48)
-    data_matrix[index,,] <- one_hot[,]
-    index <- index + 1
+    data_matrix[row,] <- compress_block(one_hot, 16048, 4)
   }
   
   return(data_matrix)
@@ -133,33 +135,34 @@ gc()
 # Model starts here
 ###################################################################################################################################
 set.seed(42)
-epochs <- 25 # 100 in paper
+epochs <- 40 # 100 in paper
 batch_size <- 64 # 8 in paper
 
 # generator to sample a random batch of training data with labels
-sampling_generator <- function(X_data, Y_data, batch_size, subset) {
+sampling_generator <- function(X_data, Y_data, batch_size) {
   function() {
-    if (subset == 'training')
+    rows <- sample(1:nrow(X_data), batch_size, replace = TRUE)
+    data_matrix <- array(0,dim = c(length(rows), 16048, 4))
+    index <- 1
+    for (row in rows)
     {
-      rows <- sample(1:nrow(X_data), batch_size, replace = TRUE)
+      decompressed <- decompress_block(X_data[row,], 16048, 4)
+      data_matrix[index,,] <- decompressed
+      index <- index + 1
     }
-    else
-    {
-      rows <- sample(1:nrow(X_data) * 0.2, batch_size, replace = TRUE) # 0.2=20% for test, 80% for train
-    }
-    return (list(X_data[rows,,], Y_data[rows,]))
+    return (list(data_matrix, Y_data[rows,]))
   }
 }
 
 # keep 10% for validation
 ind <- sample(nrow(x_train), round(nrow(x_train) * 0.90, 0), replace = FALSE)
-x_valid <- x_train[-ind,,]
-x_train <- x_train[ind,,]
+x_valid <- x_train[-ind,]
+x_train <- x_train[ind,]
 y_valid <- y_train[-ind,]
 y_train <- y_train[ind,]
 
-train_generator <- sampling_generator(x_train, y_train, batch_size = batch_size, subset = 'training')
-valid_generator <- sampling_generator(x_train, y_train, batch_size = batch_size, subset = 'validation')
+train_generator <- sampling_generator(x_train, y_train, batch_size = batch_size)
+valid_generator <- sampling_generator(x_train, y_train, batch_size = batch_size)
 
 rm(ind)
 gc()
@@ -204,19 +207,36 @@ hist <- model %>% fit_generator(train_generator,epochs = epochs,
 model %>% save_model_hdf5("final_model.h5")
 
 model <- load_model_hdf5("checkpoint.h5") # load best model
-score <- model %>% evaluate(x_valid, y_valid, batch_size = batch_size) # 75%
+
+rm(x_train, y_train)
+gc()
+
+# decompress validation data to score
+index <- 1
+data_matrix <- array(0,dim = c(dim(x_valid)[1], 16048, 4))
+for (row in 1:dim(x_valid)[1])
+{
+  decompressed <- decompress_block(x_valid[row,], 16048, 4)
+  data_matrix[index,,] <- decompressed
+  index <- index + 1
+}
+x_valid <- data_matrix
+rm(data_matrix)
+gc()
+
+score <- model %>% evaluate(x_valid, y_valid, batch_size = batch_size) # 70%
 
 # Top-n accuracy scorer
-topn = function(vector, n){
-  maxs=c()
-  ind=c()
+topn <- function(vector, n){
+  maxs <- c()
+  ind <- c()
   for (i in 1:n){
-    biggest=match(max(vector), vector)
-    ind[i]=biggest
-    maxs[i]=max(vector)
-    vector=vector[-biggest]
+    biggest <- match(max(vector), vector)
+    ind[i] <- biggest
+    maxs[i] <- max(vector)
+    vector <- vector[-biggest]
   }
-  mat=cbind(maxs, ind)
+  mat <- cbind(maxs, ind)
   return(mat)
 }
 
@@ -237,6 +257,5 @@ top_scorer <- function(x, y, model, n)
   return (mean(scores))
 }
 
-top_scorer(x_valid, y_valid, model, 10) # 80.5% in top 10
-top_scorer(x_valid, y_valid, model, 3)  # 79.2% in top 3
-
+top_scorer(x_valid, y_valid, model, 10) # 76.4% in top 10
+top_scorer(x_valid, y_valid, model, 3)  # 75.2% in top 3
